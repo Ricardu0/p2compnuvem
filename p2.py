@@ -3,14 +3,22 @@ import io
 import base64
 import streamlit as st
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload, MediaFileUpload
 from azure.storage.blob import BlobServiceClient
 
 # ==============================================================================
 # CONFIGURAÇÕES
+
+print("[DEBUG] CWD:", os.getcwd())
+print("[DEBUG] Arquivos:", os.listdir("."))
 # ==============================================================================
-GOOGLE_CREDS_PATH = "google_creds.json"
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/etc/secrets/google_creds.json")
+CREDENTIALS_PATH = "credentials.json"
+TOKEN_PATH = "token.json"
 PASTA_DRIVE_FIXA  = "1yFnqtycFOdGsRpL3Z7wp4FPv2v4cbl25"
 PASTA_DRIVE_LINK  = "https://drive.google.com/drive/u/1/folders/1yFnqtycFOdGsRpL3Z7wp4FPv2v4cbl25"
 NOME_ALUNO_FIXO   = "ricardo"
@@ -137,7 +145,7 @@ def aplicar_estilo():
         overflow: hidden; transition: border-color 0.2s, box-shadow 0.2s;
     }
     .img-card:hover { border-color: #1a1a1a; box-shadow: 3px 3px 0 #1a1a1a; }
-    .img-card img { width: 100%; height: 140px; object-fit: cover; display: block; }
+    .img-card img { width: 100%; height: 180px; object-fit: cover; display: block; }
     .img-card .img-label {
         padding: 6px 10px; font-family: 'IBM Plex Mono', monospace;
         font-size: 0.65rem; color: #888; white-space: nowrap;
@@ -171,8 +179,8 @@ def aplicar_estilo():
         transition: background 0.2s ease, color 0.2s ease !important;
     }
     .stButton > button:hover { background: #1a1a1a !important; color: #f4f4f0 !important; }
-    .stButton > button[kind="primary"] { background: #1a1a1a !important; color: #f4f4f0 !important; }
-    .stButton > button[kind="primary"]:hover { background: #444 !important; }
+    .stButton > button[kind="primary"] { background: #000000 !important; color: #ffffff !important; }
+    .stButton > button[kind="primary"]:hover { background: #444444 !important; }
 
     .stCheckbox label { font-family: 'IBM Plex Sans', sans-serif; font-size: 0.85rem; color: #444; }
     .stProgress > div > div { background: #1a1a1a !important; border-radius: 0 !important; }
@@ -229,12 +237,53 @@ def eh_imagem(nome):
 # CONEXÕES
 # ==============================================================================
 def obter_servico_drive():
-    if not os.path.exists(GOOGLE_CREDS_PATH):
-        raise FileNotFoundError(f"'{GOOGLE_CREDS_PATH}' não encontrado.")
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_CREDS_PATH,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"]
-    )
+    SCOPES = ["https://www.googleapis.com/auth/drive"]
+    
+    # Try Service Account first if the file exists
+    if os.path.exists(GOOGLE_CREDS_PATH):
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDS_PATH, scopes=SCOPES
+            )
+            return build("drive", "v3", credentials=creds)
+        except Exception as e:
+            st.warning(f"Falha ao carregar credenciais de serviço: {e}. Tentando OAuth local...")
+
+    # Fallback to User OAuth Flow
+    creds = None
+    # Load token if it exists and is a valid JSON file
+    if os.path.exists(TOKEN_PATH) and os.path.getsize(TOKEN_PATH) > 0:
+        try:
+            # Attempt to parse the token to ensure it is valid JSON
+            import json
+            with open(TOKEN_PATH, "r", encoding="utf-8") as _f:
+                json.load(_f)
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        except Exception:
+            # Token is corrupted or not a valid JSON – delete it and fall back to OAuth flow
+            try:
+                os.remove(TOKEN_PATH)
+                st.warning("Token corrompido removido. Iniciando novo fluxo de login.")
+            except Exception as rm_err:
+                st.error(f"Erro ao remover token inválido: {rm_err}")
+            creds = None
+        else:
+            # Token loaded successfully
+            pass
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+                creds = flow.run_local_server(port=8080)
+        else:
+            if not os.path.exists(CREDENTIALS_PATH):
+                raise FileNotFoundError(f"'{CREDENTIALS_PATH}' não encontrado.")
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            creds = flow.run_local_server(port=8080)
+        with open(TOKEN_PATH, 'w') as token:
+            token.write(creds.to_json())
     return build("drive", "v3", credentials=creds)
 
 
@@ -313,6 +362,62 @@ def migrar_arquivo(file_id, file_name, container_alvo, pular_existentes=False, b
     except Exception as e:
         return "error", str(e)
 
+
+def baixar_blob(container_nome, blob_nome):
+    try:
+        blob_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING).get_blob_client(
+            container=container_nome, blob=blob_nome
+        )
+        stream = io.BytesIO()
+        stream.write(blob_client.download_blob().readall())
+        stream.seek(0)
+        return stream
+    except Exception:
+        return None
+
+def migrar_para_drive(blob_nome, container_nome, folder_id):
+    try:
+        stream = baixar_blob(container_nome, blob_nome)
+        if not stream:
+            return "error", "Falha ao baixar do Azure"
+        
+        service = obter_servico_drive()
+        file_metadata = {'name': blob_nome, 'parents': [folder_id]}
+        media = MediaIoBaseUpload(stream, mimetype='application/octet-stream', resumable=True)
+        
+        # Check if exists
+        results = service.files().list(q=f"'{folder_id}' in parents and name='{blob_nome}' and trashed=false", fields="files(id)").execute()
+        files = results.get('files', [])
+        if files:
+            # Overwrite/Update existing file
+            service.files().update(fileId=files[0]['id'], media_body=media).execute()
+        else:
+            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        
+        return "ok", "Migrado para o Drive com sucesso."
+    except Exception as e:
+        return "error", str(e)
+
+
+# ==============================================================================
+# PREVIEW E DIALOGS
+# ==============================================================================
+@st.dialog("Visualização de Arquivo", width="large")
+def modal_visualizar(nome_arquivo, dados_bytes):
+    st.write(f"**Arquivo:** {nome_arquivo}")
+    if eh_imagem(nome_arquivo):
+        st.image(dados_bytes, use_container_width=True)
+    elif nome_arquivo.lower().endswith(".pdf"):
+        base64_pdf = base64.b64encode(dados_bytes).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    else:
+        try:
+            texto = dados_bytes.decode('utf-8')
+            st.text_area("Conteúdo do Texto", texto, height=400)
+        except Exception:
+            st.info("Pré-visualização não suportada para este tipo de arquivo binário.")
+            st.download_button(label="Fazer Download", data=dados_bytes, file_name=nome_arquivo)
 
 # ==============================================================================
 # RENDERIZADORES
@@ -408,6 +513,20 @@ with tab_drive:
                     st.session_state.pop("imagens_cache", None)
                 except Exception as e:
                     st.error(f"Erro: {e}")
+        # ---- NEW: upload files to Drive ----
+        uploaded_files = st.file_uploader("Selecionar arquivos para upload", accept_multiple_files=True, key="upload_files")
+        if uploaded_files:
+            if st.button("Upload to Drive", key="btn_upload_drive", type="primary"):
+                with st.spinner("Enviando para o Google Drive..."):
+                    service = obter_servico_drive()
+                    for up_file in uploaded_files:
+                        # Prepare media upload
+                        mime = up_file.type or "application/octet-stream"
+                        media = MediaIoBaseUpload(up_file, mimetype=mime, resumable=True)
+                        file_metadata = {"name": up_file.name, "parents": [PASTA_DRIVE_FIXA]}
+                        service.files().create(body=file_metadata, media_body=media).execute()
+                    st.success(f"{len(uploaded_files)} arquivo(s) enviado(s) ao Drive.")
+
 
     arquivos = st.session_state.get("arquivos_drive", [])
 
@@ -449,7 +568,17 @@ with tab_drive:
         if outros:
             st.markdown('<div class="section-label">Outros Arquivos</div>', unsafe_allow_html=True)
             for arq in outros:
-                render_file_card(arq["name"], arq.get("size"))
+                c_card, c_btn = st.columns([9, 1], vertical_alignment="center")
+                with c_card:
+                    render_file_card(arq["name"], arq.get("size"))
+                with c_btn:
+                    if st.button("👁️", key=f"btn_view_drive_{arq['id']}"):
+                        with st.spinner("Baixando preview..."):
+                            dados = baixar_thumbnail(service, arq["id"])
+                            if dados:
+                                modal_visualizar(arq["name"], dados)
+                            else:
+                                st.error("Erro ao carregar preview.")
 
     elif "arquivos_drive" in st.session_state:
         st.info("Nenhum arquivo encontrado na pasta. Adicione arquivos via o link acima e liste novamente.")
@@ -498,10 +627,59 @@ with tab_container:
         total_blob = sum(int(b.get("size", 0) or 0) for b in blobs)
         render_counter_row([(len(blobs), "Blobs"), (formatar_tamanho(total_blob), "Tamanho Total")])
         st.markdown('<div class="section-label">Arquivos no Contêiner</div>', unsafe_allow_html=True)
+        
+        # Select all checkbox
+        selecionar_todos = st.checkbox("Selecionar Todos")
+        
+        arquivos_selecionados = []
         for b in blobs:
             mod = b["last_modified"].strftime("%d/%m/%Y %H:%M") if b.get("last_modified") else ""
-            render_file_card(b["name"], b.get("size"),
-                             extra_html=f'<span class="file-size">{mod}</span>' if mod else "")
+            
+            c_chk, c_card, c_btn = st.columns([0.5, 8.5, 1], vertical_alignment="center")
+            with c_chk:
+                if st.checkbox(" ", key=f"chk_{b['name']}", value=selecionar_todos):
+                    arquivos_selecionados.append(b['name'])
+            with c_card:
+                render_file_card(b["name"], b.get("size"), extra_html=f'<span class="file-size">{mod}</span>' if mod else "")
+            with c_btn:
+                if st.button("👁️", key=f"btn_view_azure_{b['name']}"):
+                    with st.spinner("Baixando preview..."):
+                        stream = baixar_blob(st.session_state["container_alvo"], b["name"])
+                        if stream:
+                            modal_visualizar(b["name"], stream.read())
+                        else:
+                            st.error("Erro ao carregar preview.")
+                            
+        if arquivos_selecionados:
+            st.markdown("<hr>", unsafe_allow_html=True)
+            if st.button("📤 Migrar Selecionados para o Google Drive", type="primary", key="btn_migrar_drive"):
+                st.markdown('<div class="section-label">Log de Migração (Azure → Drive)</div>', unsafe_allow_html=True)
+                barra2 = st.progress(0)
+                status_texto2 = st.empty()
+                sucessos2, erros2 = 0, 0
+                resultados2 = []
+                
+                for idx, arq_nome in enumerate(arquivos_selecionados):
+                    status_texto2.markdown(
+                        f'<div class="info-block" style="padding:10px 16px;">'
+                        f'<div class="label">Enviando {idx+1} de {len(arquivos_selecionados)}</div>'
+                        f'<div class="value">{arq_nome}</div></div>',
+                        unsafe_allow_html=True
+                    )
+                    res, msg = migrar_para_drive(arq_nome, st.session_state["container_alvo"], PASTA_DRIVE_FIXA)
+                    resultados2.append((arq_nome, res, msg))
+                    if res == "ok": sucessos2 += 1
+                    else: erros2 += 1
+                    barra2.progress((idx+1) / len(arquivos_selecionados))
+                    
+                status_texto2.empty()
+                render_counter_row([(sucessos2, "Enviados"), (erros2, "Erros")])
+                for nome, res, msg in resultados2:
+                    if res == "ok":
+                        st.success(f"{nome}: {msg}")
+                    else:
+                        st.error(f"{nome}: {msg}")
+
     elif "blobs_destino" in st.session_state:
         st.markdown('<div class="info-block" style="border-style:dashed;text-align:center;color:#aaa;padding:40px;"><div style="font-size:1.5rem;">📭</div><div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.82rem;margin-top:8px;">Contêiner vazio — pronto para receber arquivos.</div></div>', unsafe_allow_html=True)
     else:
